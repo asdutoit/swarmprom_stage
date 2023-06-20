@@ -1,0 +1,274 @@
+networks:
+  loki:
+    driver: overlay
+    attachable: true
+  traefik-public:
+    external: true
+    name: traefik-public
+
+volumes:
+    prometheus: {}
+    grafana: {}
+    alertmanager: {}
+    loki-data: {}
+
+configs:
+  dockerd_config:
+    file: ./dockerd-exporter/Caddyfile
+  node_rules:
+    file: ./prometheus/rules/swarm_node.rules.yml
+  task_rules:
+    file: ./prometheus/rules/swarm_task.rules.yml
+
+services:
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - TERM=linux
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-piechart-panel,grafana-polystat-panel
+      - GF_LOG_MODE=console file
+      - GF_SERVER_ROOT_URL="http://localhost:3010"
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=smtp.sendgrid.net:587
+      - GF_SMTP_USER=apikey
+      - GF_SMTP_PASSWORD=""
+      - GF_SMTP_FROM_ADDRESS=""
+      - GF_SMTP_FROM_NAME=Grafana
+      - GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+    volumes:
+      - ./grafana:/var/lib/grafana
+    restart: unless-stopped
+    networks:
+      - loki
+      - traefik-public
+      - default
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      labels:
+        - traefik.enable=true
+        - traefik.labels=stripped
+        - traefik.docker.network=traefik-public
+        - traefik.constraint-label=traefik-public
+        - traefik.http.routers.swarmprom-grafana-http.rule=Host(`grafana.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-grafana-http.entrypoints=http
+        - traefik.http.routers.swarmprom-grafana-http.middlewares=https-redirect
+        - traefik.http.routers.swarmprom-grafana-https.rule=Host(`grafana.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-grafana-https.entrypoints=https
+        - traefik.http.routers.swarmprom-grafana-https.tls=true
+        - traefik.http.routers.swarmprom-grafana-https.tls.certresolver=le
+        - traefik.http.services.swarmprom-grafana.loadbalancer.server.port=3000
+    # entrypoint:
+    #   - sh
+    #   - -euc
+    #   - |
+    #     mkdir -p /etc/grafana/provisioning/datasources
+    #     cat <<EOF > /etc/grafana/provisioning/datasources/ds.yaml
+    #     apiVersion: 1
+    #     datasources:
+    #     - name: Loki
+    #       type: loki
+    #       access: proxy 
+    #       orgId: 1
+    #       url: http://loki:3100
+    #       basicAuth: false
+    #       isDefault: true
+    #       version: 1
+    #       editable: false
+    #     EOF
+    #     /run.sh
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus:/prometheus
+    networks:
+      - loki
+      - default
+      - traefik-public
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention=${PROMETHEUS_RETENTION:-24h}'
+    configs:
+      - source: node_rules
+        target: /etc/prometheus/swarm_node.rules.yml
+      - source: task_rules
+        target: /etc/prometheus/swarm_task.rules.yml
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 2048M
+        reservations:
+          memory: 128M
+      labels:
+        - traefik.enable=true
+        - traefik.docker.network=traefik-public
+        - traefik.constraint-label=traefik-public
+        - traefik.http.routers.swarmprom-prometheus-http.rule=Host(`prometheus.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-prometheus-http.entrypoints=http
+        - traefik.http.routers.swarmprom-prometheus-http.middlewares=https-redirect
+        - traefik.http.routers.swarmprom-prometheus-https.rule=Host(`prometheus.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-prometheus-https.entrypoints=https
+        - traefik.http.routers.swarmprom-prometheus-https.tls=true
+        - traefik.http.routers.swarmprom-prometheus-https.tls.certresolver=le
+        - traefik.http.services.swarmprom-prometheus.loadbalancer.server.port=9090
+        - traefik.http.middlewares.swarmprom-prometheus-auth.basicauth.users=${ADMIN_USER?Variable not set}:${HASHED_PASSWORD?Variable not set}
+        - traefik.http.routers.swarmprom-prometheus-https.middlewares=swarmprom-prometheus-auth
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /etc/hostname:/etc/nodename
+    networks:
+      - loki
+    environment:
+      - NODE_ID={{.Node.ID}}
+      - NODE_NAME={{.Node.Hostname}}
+      - NODE_ADDRESS={{.Node.IP}}
+      - NODE_HOSTNAME={{.Node.Hostname}}
+    command:
+      - '--path.sysfs=/host/sys'
+      - '--path.procfs=/host/proc'
+      - '--collector.textfile.directory=/etc/node-exporter/'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--no-collector.ipvs'
+    deploy:
+      mode: global
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+  
+  loki:
+    image: grafana/loki:main
+    volumes:
+      - ./loki:/etc/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    networks:
+      - loki
+  
+  promtail:
+    image: grafana/promtail:main
+    volumes:
+      - /var/log:/var/log
+      - ./promtail:/etc/promtail
+    ports:
+      - "9080:9080"
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yaml
+    networks:
+      - loki
+
+  alertmanager:
+    image: prom/alertmanager:main
+    networks:
+      - loki
+      - default
+      - traefik-public
+    environment:
+      # - SLACK_URL=${SLACK_URL:-https://hooks.slack.com/services/TOKEN}
+      # - SLACK_CHANNEL=${SLACK_CHANNEL:-general}
+      # - SLACK_USER=${SLACK_USER:-alertmanager}
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - alertmanager:/alertmanager
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+      constraints:
+        - node.role == manager
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+      labels:
+        - traefik.enable=true
+        - traefik.docker.network=traefik-public
+        - traefik.constraint-label=traefik-public
+        - traefik.http.routers.swarmprom-alertmanager-http.rule=Host(`alertmanager.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-alertmanager-http.entrypoints=http
+        - traefik.http.routers.swarmprom-alertmanager-http.middlewares=https-redirect
+        - traefik.http.routers.swarmprom-alertmanager-https.rule=Host(`alertmanager.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-alertmanager-https.entrypoints=https
+        - traefik.http.routers.swarmprom-alertmanager-https.tls=true
+        - traefik.http.routers.swarmprom-alertmanager-https.tls.certresolver=le
+        - traefik.http.services.swarmprom-alertmanager.loadbalancer.server.port=9093
+        - traefik.http.middlewares.swarmprom-alertmanager-auth.basicauth.users=${ADMIN_USER?Variable not set}:${HASHED_PASSWORD?Variable not set}
+        - traefik.http.routers.swarmprom-alertmanager-https.middlewares=swarmprom-alertmanager-auth
+
+  cadvisor:
+    image: google/cadvisor
+    networks:
+      - loki
+    command: -logtostderr -docker_only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/rootfs:ro
+      - /var/run:/var/run
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    deploy:
+      mode: global
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  dockerd-exporter:
+    image: stefanprodan/caddy
+    networks:
+      - loki
+    environment:
+      - DOCKER_GWBRIDGE_IP=172.18.0.1
+    configs:
+      - source: dockerd_config
+        target: /etc/caddy/Caddyfile
+    deploy:
+      mode: global
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+  
