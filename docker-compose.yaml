@@ -10,7 +10,8 @@ volumes:
     prometheus: {}
     grafana: {}
     alertmanager: {}
-    loki-data: {}
+    loki: {}
+    promtail: {}
 
 configs:
   dockerd_config:
@@ -41,7 +42,7 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
     volumes:
-      - ./grafana:/var/lib/grafana
+      - grafana:/var/lib/grafana
     restart: unless-stopped
     networks:
       - loki
@@ -155,9 +156,9 @@ services:
       - loki
     environment:
       - NODE_ID={{.Node.ID}}
-      - NODE_NAME={{.Node.Hostname}}
-      - NODE_ADDRESS={{.Node.IP}}
-      - NODE_HOSTNAME={{.Node.Hostname}}
+      # - NODE_NAME={{.Node.Hostname}}
+      # - NODE_ADDRESS={{.Node.IP}}
+      # - NODE_HOSTNAME={{.Node.Hostname}}
     command:
       - '--path.sysfs=/host/sys'
       - '--path.procfs=/host/proc'
@@ -175,7 +176,7 @@ services:
   loki:
     image: grafana/loki:main
     volumes:
-      - ./loki:/etc/loki
+      - loki:/etc/loki
     ports:
       - "3100:3100"
     restart: unless-stopped
@@ -187,14 +188,40 @@ services:
     image: grafana/promtail:main
     volumes:
       - /var/log:/var/log
-      - ./promtail:/etc/promtail
+      - promtail:/promtail
     ports:
       - "9080:9080"
     restart: unless-stopped
-    command: -config.file=/etc/promtail/promtail-config.yaml
+    command:
+      - '--config.file=/etc/promtail/promtail.yml'
+      - '--storage.path=/promtail'
     networks:
       - loki
-
+     deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 1028M
+        reservations:
+          memory: 128M
+      labels:
+        - traefik.enable=true
+        - traefik.docker.network=traefik-public
+        - traefik.constraint-label=traefik-public
+        - traefik.http.routers.swarmprom-promtail-http.rule=Host(`promtail.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-promtail-http.entrypoints=http
+        - traefik.http.routers.swarmprom-promtail-http.middlewares=https-redirect
+        - traefik.http.routers.swarmprom-promtail-https.rule=Host(`promtail.${DOMAIN?Variable not set}`)
+        - traefik.http.routers.swarmprom-promtail-https.entrypoints=https
+        - traefik.http.routers.swarmprom-promtail-https.tls=true
+        - traefik.http.routers.swarmprom-promtail-https.tls.certresolver=le
+        - traefik.http.services.swarmprom-promtail.loadbalancer.server.port=9080
+        - traefik.http.middlewares.swarmprom-promtail-auth.basicauth.users=${ADMIN_USER?Variable not set}:${HASHED_PASSWORD?Variable not set}
+        - traefik.http.routers.swarmprom-promtail-https.middlewares=swarmprom-promtail-auth
   alertmanager:
     image: prom/alertmanager:main
     networks:
@@ -202,9 +229,9 @@ services:
       - default
       - traefik-public
     environment:
-      # - SLACK_URL=${SLACK_URL:-https://hooks.slack.com/services/TOKEN}
-      # - SLACK_CHANNEL=${SLACK_CHANNEL:-general}
-      # - SLACK_USER=${SLACK_USER:-alertmanager}
+      - SLACK_URL=${SLACK_URL:-https://hooks.slack.com/services/TOKEN}
+      - SLACK_CHANNEL=${SLACK_CHANNEL:-general}
+      - SLACK_USER=${SLACK_USER:-alertmanager}
     command:
       - '--config.file=/etc/alertmanager/alertmanager.yml'
       - '--storage.path=/alertmanager'
@@ -214,8 +241,8 @@ services:
       mode: replicated
       replicas: 1
       placement:
-      constraints:
-        - node.role == manager
+        constraints:
+          - node.role == manager
       resources:
         limits:
           memory: 128M
